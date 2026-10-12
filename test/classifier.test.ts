@@ -132,4 +132,51 @@ describe("classificador", () => {
     ];
     for (const reason of reasons) expect(reason).not.toMatch(/[a-z]+_[a-z]+/);
   });
+
+  describe("casos achados no sanity check", () => {
+    it("compra longa logo no começo da série ainda é pico (a base inicial não é puxada por ela)", () => {
+      const rng = new Rng(3);
+      const block = Array.from({ length: 13 }, () => Math.round(8_000 * (1 + 0.005 * rng.normal())));
+      const result = classify(add(audience(300), 3, block));
+      expect(result.classification).toBe("suspeito");
+      expect(result.events[0]).toMatchObject({ kind: "pico", start_hour: 3 });
+    });
+
+    it("recorrência exige o mesmo sinal: degrau, queda e degrau alinhados por acaso não acusam", () => {
+      const push = [4_000, 2_800, 2_000, 1_400, 1_000, 700];
+      const views = add(add(add(audience(300), 30, push), 50, [1_200, 2_500, 4_000, 4_100, 600]), 78, push);
+      const result = classify(views);
+      expect(result.classification).toBe("inconclusivo");
+      expect(result.reason).not.toContain("intervalo fixo:");
+    });
+
+    it("fluxo de bot contínuo sobre audiência pequena é um trecho só, não 'entrega programada'", () => {
+      const views = audience(20, 3).map((v, h) => v + (h >= 40 ? 200 : 0));
+      const result = classify(views);
+      expect(result.classification).toBe("suspeito");
+      expect(ids(result.signals)).toEqual(["repeticao", "sem_ciclo_diario"]);
+      expect(result.events).toEqual([expect.objectContaining({ kind: "repeticao", start_hour: 40, end_hour: 167 })]);
+      expect(result.reason).not.toContain("intervalo fixo");
+    });
+
+    it("horário do público com poucas views é ruído: degrau de criador pequeno de madrugada não é acusado", () => {
+      const tiny = audience(4).map((v, h) => v + (h >= 90 && h < 93 ? [600, 200, 60][h - 90]! : 0));
+      expect(classify(tiny).classification).toBe("inconclusivo");
+    });
+
+    it("o motivo de um sinal isolado explica a alternativa legítima daquele sinal", () => {
+      const rng = new Rng(9);
+      const plateau = [4_000, ...Array.from({ length: 20 }, () => Math.round(8_000 * (1 + 0.005 * rng.normal()))), 4_000, 2_000, 1_000];
+      const result = classify(add(audience(300), 80, plateau));
+      expect(ids(result.signals)).toEqual(["plato"]);
+      expect(result.reason).not.toContain("arquivado");
+      expect(result.reason).toContain("audiência estável");
+    });
+
+    it("série zerada é inconclusiva e o motivo não cresce sem limite", () => {
+      expect(classify(Array(48).fill(0)).classification).toBe("inconclusivo");
+      const zigzag = Array.from({ length: 2160 }, (_, h) => (h % 2 ? 1_000 : 0));
+      expect(classify(zigzag).reason.length).toBeLessThan(2_000);
+    });
+  });
 });

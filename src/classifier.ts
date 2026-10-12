@@ -40,7 +40,7 @@ export interface ClassificationResult {
 export const CRITERIA = {
   /** Abaixo disso não há base antes do pico nem dois ciclos de dia e noite. */
   minHours: 48,
-  /** A base é a mediana das últimas 24 horas fora de pico. */
+  /** A base é a mediana das últimas 24 horas fora de pico (no começo da série, a mediana da série inteira). */
   baselineHours: 24,
   /** Uma hora entra em pico quando passa de 3x a base e de base + 300. */
   peakFactor: 3,
@@ -53,6 +53,9 @@ export const CRITERIA = {
   flatMinMean: 50,
   plateauMinHours: 5,
   repetitionMinHours: 6,
+  /** Trechos planos de nível parecido (até 10% de diferença) separados por até 3h são o mesmo fluxo. */
+  flatMergeGap: 3,
+  flatMergeLevel: 0.1,
   noCycleMinHours: 24,
   /** Queda abrupta: perde 75% ou mais em uma hora, partindo de pelo menos metade do pico. */
   cliffDrop: 0.75,
@@ -64,6 +67,8 @@ export const CRITERIA = {
    */
   offHours: 6,
   cycleMinRatio: 1.5,
+  /** Com menos de 50 views/h no horário mais ativo, a diferença entre horas é ruído de contagem. */
+  cycleMinActive: 50,
   peakTailHours: 12,
   /** 3 eventos de um sinal com o mesmo intervalo entre eles (±3h, intervalo de pelo menos 12h) viram suspeito. */
   recurrenceCount: 3,
@@ -111,7 +116,8 @@ interface Peak {
  * 24 horas que não estavam em pico, então um pico não infla a base do próximo, e fica fixa enquanto o pico dura.
  */
 function findPeaks(views: number[]): Peak[] {
-  const initial = median(views.slice(0, CRITERIA.baselineHours));
+  // No começo ainda não há 12h fora de pico; a mediana da série inteira não é puxada por uma compra no início.
+  const initial = median(views);
   const quiet: number[] = [];
   const peaks: Peak[] = [];
   let t = 0;
@@ -139,6 +145,8 @@ interface FlatRun {
   max: number;
   /** Maior variação entre as janelas de 5h do trecho. */
   worst: number;
+  /** Juntou trechos separados por pausas curtas. */
+  gaps: boolean;
 }
 
 /**
@@ -169,10 +177,40 @@ function findFlatRuns(views: number[]): FlatRun[] {
       min: Math.min(...values),
       max: Math.max(...values),
       worst: Math.max(...Array.from({ length: last - i + 1 }, (_, k) => windowVariation(views, i + k, size))),
+      gaps: false,
     });
     i = last + size;
   }
-  return runs;
+  return mergeRuns(runs);
+}
+
+/**
+ * Um fluxo de bot sobre uma audiência pequena pode passar de 5% em algumas janelas por causa do ciclo do público
+ * e se partir em pedaços. Pedaços de nível parecido separados por até 3h voltam a ser um trecho só.
+ */
+function mergeRuns(runs: FlatRun[]): FlatRun[] {
+  const level = (r: FlatRun) => (r.min + r.max) / 2;
+  const merged: FlatRun[] = [];
+  for (const run of runs) {
+    const prev = merged.at(-1);
+    if (
+      prev &&
+      run.start - prev.end - 1 <= CRITERIA.flatMergeGap &&
+      Math.abs(level(run) - level(prev)) <= CRITERIA.flatMergeLevel * Math.max(level(run), level(prev))
+    ) {
+      merged[merged.length - 1] = {
+        start: prev.start,
+        end: run.end,
+        min: Math.min(prev.min, run.min),
+        max: Math.max(prev.max, run.max),
+        worst: Math.max(prev.worst, run.worst),
+        gaps: true,
+      };
+    } else {
+      merged.push(run);
+    }
+  }
+  return merged;
 }
 
 function windowVariation(views: number[], start: number, size: number): number {
@@ -181,6 +219,7 @@ function windowVariation(views: number[], start: number, size: number): number {
 }
 
 const runLength = (r: FlatRun) => r.end - r.start + 1;
+const runHours = (r: FlatRun) => `${runLength(r)}h ${r.gaps ? `(com pausas de até ${CRITERIA.flatMergeGap}h)` : "seguidas"}`;
 
 function noCycle(run: FlatRun): Signal | undefined {
   const length = runLength(run);
@@ -210,7 +249,8 @@ function dailyCycle(views: number[], peaks: Peak[]): DailyCycle {
   const known = profile.flatMap((v, hd) => (v === undefined ? [] : [{ hd, v }]));
   const low = Math.min(...known.map((k) => k.v));
   const high = Math.max(...known.map((k) => k.v));
-  const clear = known.length === 24 && high >= CRITERIA.cycleMinRatio * Math.max(low, 1);
+  const clear =
+    known.length === 24 && high >= CRITERIA.cycleMinActive && high >= CRITERIA.cycleMinRatio * Math.max(low, 1);
   const quietest = clear ? known.sort((a, b) => a.v - b.v || a.hd - b.hd).slice(0, CRITERIA.offHours) : [];
   return { profile, quietest: new Set(quietest.map((k) => k.hd)) };
 }
@@ -248,7 +288,7 @@ function peakSignals(views: number[], peak: Peak, runs: FlatRun[], cycle: DailyC
       signal(
         "plato",
         plateau.start,
-        `ficou ${runLength(plateau)}h seguidas entre ${n(plateau.min)} e ${n(plateau.max)} views/h ` +
+        `ficou ${runHours(plateau)} entre ${n(plateau.min)} e ${n(plateau.max)} views/h ` +
           `${hours(plateau.start, plateau.end)}, sem variar mais de ${p(plateau.worst)}% em 5h, quando audiência real oscila`,
       ),
     );
@@ -283,12 +323,18 @@ function classOf(signals: Signal[]): Classification {
   return signals.length === 1 ? "inconclusivo" : "organico";
 }
 
-const VERDICT: Record<Classification, string> = {
-  suspeito: "Audiência real não mostra esses sinais juntos.",
-  inconclusivo:
-    "Um sinal sozinho não basta para acusar: pode ser o algoritmo da plataforma, vídeo arquivado ou um compartilhamento grande.",
-  organico: "",
+/** Por que um sinal sozinho não basta: a explicação legítima mais comum para cada um. */
+const ALONE: Partial<Record<SignalId, string>> = {
+  degrau: "um compartilhamento grande ou um post que pegou na hora também chegam de uma vez",
+  queda_abrupta: "vídeo arquivado ou alcance cortado pelo algoritmo da plataforma também derrubam as views de uma vez",
+  plato: "algumas horas de audiência estável podem acontecer por acaso quando nada mais é estranho",
+  repeticao: "menos de um dia de views quase constantes ainda pode ser um público estável por coincidência",
 };
+
+function verdict(signals: Signal[]): string {
+  if (signals.length >= 2) return "Audiência real não mostra esses sinais juntos.";
+  return `Um sinal sozinho não basta para acusar: ${ALONE[signals[0]!.id] ?? "falta outro sinal que confirme"}.`;
+}
 
 function describePeak(views: number[], peak: Peak, signals: Signal[]): string {
   const where = `Pico de ${n(peak.peak)} views/h ${hours(peak.start, peak.end)} (dia ${day(peak.start)}), sobre uma base de ~${n(peak.baseline)}`;
@@ -297,7 +343,7 @@ function describePeak(views: number[], peak: Peak, signals: Signal[]): string {
     const rise = top - peak.start + 1;
     return `${where}: subiu em ${rise}h e desceu aos poucos, como audiência real.`;
   }
-  return `${where}: ${signals.map((s) => s.detail).join("; ")}. ${VERDICT[classOf(signals)]}`;
+  return `${where}: ${signals.map((s) => s.detail).join("; ")}. ${verdict(signals)}`;
 }
 
 function buildEvents(views: number[]): ViewEvent[] {
@@ -326,7 +372,7 @@ function buildEvents(views: number[]): ViewEvent[] {
       signal(
         "repeticao",
         run.start,
-        `${runLength(run)}h seguidas entre ${n(run.min)} e ${n(run.max)} views/h ${hours(run.start, run.end)}, ` +
+        `${runHours(run)} entre ${n(run.min)} e ${n(run.max)} views/h ${hours(run.start, run.end)}, ` +
           `sem variar mais de ${p(run.worst)}% em 5h e sem pico que explique`,
       ),
     ];
@@ -341,7 +387,7 @@ function buildEvents(views: number[]): ViewEvent[] {
       baseline: Math.round((run.min + run.max) / 2),
       signals,
       classification: classOf(signals),
-      reason: `Views quase constantes: ${signals.map((s) => s.detail).join("; ")}. ${VERDICT[classOf(signals)]}`,
+      reason: `Views quase constantes: ${signals.map((s) => s.detail).join("; ")}. ${verdict(signals)}`,
     });
   }
 
@@ -349,8 +395,8 @@ function buildEvents(views: number[]): ViewEvent[] {
 }
 
 /**
- * Recorrência: 3 eventos de um sinal só, separados pelo mesmo intervalo (24h e 24h, 48h e 48h...), com
- * tolerância de 3h. Devolve a sequência mais longa encontrada.
+ * Recorrência: 3 eventos com o mesmo sinal (e só ele), separados pelo mesmo intervalo (24h e 24h, 48h e 48h...),
+ * com tolerância de 3h. Devolve a sequência mais longa encontrada.
  */
 function periodicRecurrence(events: ViewEvent[]): { chain: ViewEvent[]; period: number } | undefined {
   const single = events.filter((e) => e.signals.length === 1);
@@ -358,16 +404,25 @@ function periodicRecurrence(events: ViewEvent[]): { chain: ViewEvent[]; period: 
   let best: { chain: ViewEvent[]; period: number } | undefined;
   for (let i = 0; i < single.length; i++) {
     for (let j = i + 1; j < single.length; j++) {
+      const kind = single[i]!.signals[0]!.id;
       const period = at(single[j]!) - at(single[i]!);
-      if (period < CRITERIA.recurrenceMinPeriod) continue;
+      if (single[j]!.signals[0]!.id !== kind || period < CRITERIA.recurrenceMinPeriod) continue;
       const chain = [single[i]!, single[j]!];
       for (const e of single.slice(j + 1)) {
-        if (Math.abs(at(e) - at(chain.at(-1)!) - period) <= CRITERIA.recurrenceTolerance) chain.push(e);
+        const fits = Math.abs(at(e) - at(chain.at(-1)!) - period) <= CRITERIA.recurrenceTolerance;
+        if (fits && e.signals[0]!.id === kind) chain.push(e);
       }
       if (chain.length >= CRITERIA.recurrenceCount && chain.length > (best?.chain.length ?? 0)) best = { chain, period };
     }
   }
   return best;
+}
+
+/** O motivo geral cita no máximo 3 eventos; o resto fica em `events`. */
+function joinReasons(events: ViewEvent[]): string {
+  const shown = events.slice(0, 3).map((e) => e.reason).join(" ");
+  const rest = events.length - 3;
+  return rest > 0 ? `${shown} Mais ${rest} evento(s) do mesmo tipo na lista de eventos.` : shown;
 }
 
 const list = (items: number[]) =>
@@ -387,12 +442,22 @@ export function classify(views: number[]): ClassificationResult {
     };
   }
 
+  if (views.every((v) => v === 0)) {
+    return {
+      classification: "inconclusivo",
+      reason: `Inconclusivo. A série tem ${total}h e nenhuma view: não há audiência para avaliar.`,
+      signals: [],
+      events: [],
+      hours: total,
+    };
+  }
+
   const events = buildEvents(views);
   const suspicious = events.filter((e) => e.classification === "suspeito");
   if (suspicious.length > 0) {
     return {
       classification: "suspeito",
-      reason: `Suspeito. ${suspicious.map((e) => e.reason).join(" ")}`,
+      reason: `Suspeito. ${joinReasons(suspicious)}`,
       signals: suspicious.flatMap((e) => e.signals),
       events,
       hours: total,
@@ -403,12 +468,12 @@ export function classify(views: number[]): ClassificationResult {
   if (recurring) {
     const { chain, period } = recurring;
     const detail =
-      `${chain.length} eventos com um sinal cada, a cada ~${period}h: ` +
-      chain.map((e) => `${e.signals[0]!.label.toLowerCase()} na hora ${e.signals[0]!.hour}`).join(", ");
+      `${chain[0]!.signals[0]!.label.toLowerCase()} ${chain.length} vezes, a cada ~${period}h ` +
+      `(horas ${list(chain.map((e) => e.signals[0]!.hour))}), sem outro sinal junto`;
     return {
       classification: "suspeito",
       reason:
-        `Suspeito. A mesma anomalia volta em intervalo fixo: ${detail}. Uma vez pode ser o algoritmo; ` +
+        `Suspeito. O mesmo sinal volta em intervalo fixo: ${detail}. Uma vez pode ser o algoritmo; ` +
         "repetida no mesmo ritmo parece entrega programada.",
       signals: [signal("recorrencia", chain[0]!.signals[0]!.hour, detail), ...chain.flatMap((e) => e.signals)],
       events,
@@ -425,7 +490,7 @@ export function classify(views: number[]): ClassificationResult {
         : "";
     return {
       classification: "inconclusivo",
-      reason: `Inconclusivo. ${doubtful.map((e) => e.reason).join(" ")}${spread}`,
+      reason: `Inconclusivo. ${joinReasons(doubtful)}${spread}`,
       signals: doubtful.flatMap((e) => e.signals),
       events,
       hours: total,
